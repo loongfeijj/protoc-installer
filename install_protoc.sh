@@ -206,12 +206,25 @@ chmod +x "$PROTOC_BIN"
 
 log "Installing protoc..."
 
-mkdir -p "${PREFIX}/bin" "${PREFIX}/include"
+SUDO=()
 
-install -m 755 "$PROTOC_BIN" "${PREFIX}/bin/protoc"
+if [[ ! -w "$PREFIX" ]] && [[ "$(id -u)" -ne 0 ]]; then
+    command -v sudo >/dev/null 2>&1 \
+        || die "Permission denied: $PREFIX (sudo is not available)"
+
+    SUDO=(sudo)
+fi
+
+"${SUDO[@]}" mkdir -p "${PREFIX}/bin" "${PREFIX}/include"
+
+"${SUDO[@]}" install -m 755 \
+    "$PROTOC_BIN" \
+    "${PREFIX}/bin/protoc"
 
 if [[ -d "${EXTRACT_DIR}/include" ]]; then
-    cp -a "${EXTRACT_DIR}/include/." "${PREFIX}/include/"
+    "${SUDO[@]}" cp -a \
+        "${EXTRACT_DIR}/include/." \
+        "${PREFIX}/include/"
 fi
 
 # -------------------------------------------------------------------
