@@ -12,23 +12,20 @@
 #
 # Environment variables:
 #   PREFIX              Installation prefix (default: $HOME/.local)
+#   GITHUB_MIRROR       GitHub download URL prefix (default: https://github.com)
 #   PROTOC_SHA256       Expected SHA256 checksum (optional)
 #   REQUIRE_CHECKSUM    Require checksum verification (default: 0)
 #
-# Example:
-#   PREFIX=/usr/local sudo -E ./install_protoc.sh 3.19.4
-#
 # Requirements:
-#   curl, unzip, python3
+#   bash, curl or wget, unzip, sha256sum or shasum
 #
 
 set -Eeuo pipefail
 
-readonly REPO="protocolbuffers/protobuf"
-readonly API_URL="https://api.github.com/repos/${REPO}/releases/tags"
-
 PREFIX="${PREFIX:-${HOME}/.local}"
+GITHUB_MIRROR="${GITHUB_MIRROR:-https://github.com}"
 REQUIRE_CHECKSUM="${REQUIRE_CHECKSUM:-0}"
+PROTOC_SHA256="${PROTOC_SHA256:-}"
 
 die() {
     echo "error: $*" >&2
@@ -52,7 +49,8 @@ Examples:
 
 Environment:
   PREFIX              Installation directory (default: \$HOME/.local)
-  PROTOC_SHA256       Expected SHA256 checksum
+  GITHUB_MIRROR       GitHub URL prefix (default: https://github.com)
+  PROTOC_SHA256       Expected SHA256 checksum (optional)
   REQUIRE_CHECKSUM    Require checksum verification (default: 0)
 EOF
     exit 1
@@ -69,10 +67,12 @@ VERSION="${1#v}"
 [[ "$VERSION" =~ ^[0-9]+(\.[0-9]+)*([.-][0-9A-Za-z]+)*$ ]] \
     || die "Invalid version: $1"
 
-for cmd in curl unzip python3; do
-    command -v "$cmd" >/dev/null 2>&1 \
-        || die "Required command not found: $cmd"
-done
+command -v curl >/dev/null 2>&1 \
+    || command -v wget >/dev/null 2>&1 \
+    || die "curl or wget is required"
+
+command -v unzip >/dev/null 2>&1 \
+    || die "unzip is required"
 
 # -------------------------------------------------------------------
 # Detect platform and architecture
@@ -105,13 +105,18 @@ case "$ARCH" in
         ;;
 esac
 
+# -------------------------------------------------------------------
+# Build official release URL
+# -------------------------------------------------------------------
+
 ASSET="protoc-${VERSION}-${OS_NAME}-${ARCH_NAME}.zip"
-TAG="v${VERSION}"
-DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${TAG}/${ASSET}"
+
+DOWNLOAD_URL="${GITHUB_MIRROR%/}/protocolbuffers/protobuf/releases/download/v${VERSION}/${ASSET}"
 
 log "Version:      ${VERSION}"
 log "Platform:     ${OS_NAME}-${ARCH_NAME}"
 log "Install path: ${PREFIX}"
+log "Download URL: ${DOWNLOAD_URL}"
 
 # -------------------------------------------------------------------
 # Prepare temporary directory
@@ -121,45 +126,9 @@ TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
 ZIP_FILE="${TMP_DIR}/${ASSET}"
-API_FILE="${TMP_DIR}/release.json"
 EXTRACT_DIR="${TMP_DIR}/extracted"
 
 mkdir -p "$EXTRACT_DIR"
-
-# -------------------------------------------------------------------
-# Resolve release asset and checksum from GitHub API
-# -------------------------------------------------------------------
-
-log "Fetching release metadata..."
-
-if ! curl -fsSL \
-    -H "Accept: application/vnd.github+json" \
-    "${API_URL}/${TAG}" \
-    -o "$API_FILE"; then
-    die "Failed to fetch release metadata: ${TAG}"
-fi
-
-ASSET_INFO="$(python3 - "$API_FILE" "$ASSET" <<'PY'
-import json
-import sys
-
-path, name = sys.argv[1:]
-
-with open(path, encoding="utf-8") as f:
-    release = json.load(f)
-
-for asset in release.get("assets", []):
-    if asset.get("name") == name:
-        print(asset["browser_download_url"])
-        print(asset.get("digest") or "")
-        sys.exit(0)
-
-sys.exit(1)
-PY
-)" || die "Asset not found: ${ASSET}"
-
-DOWNLOAD_URL="$(printf '%s\n' "$ASSET_INFO" | sed -n '1p')"
-RELEASE_SHA256="$(printf '%s\n' "$ASSET_INFO" | sed -n '2p')"
 
 # -------------------------------------------------------------------
 # Download
@@ -167,51 +136,50 @@ RELEASE_SHA256="$(printf '%s\n' "$ASSET_INFO" | sed -n '2p')"
 
 log "Downloading ${ASSET}..."
 
-curl -fL --retry 3 --retry-delay 2 \
-    "$DOWNLOAD_URL" \
-    -o "$ZIP_FILE"
+if command -v curl >/dev/null 2>&1; then
+    curl -fL --retry 3 --retry-delay 2 \
+        --connect-timeout 20 \
+        "$DOWNLOAD_URL" \
+        -o "$ZIP_FILE" \
+        || die "Failed to download ${ASSET}"
+else
+    wget -q --tries=3 \
+        -O "$ZIP_FILE" \
+        "$DOWNLOAD_URL" \
+        || die "Failed to download ${ASSET}"
+fi
 
 [[ -s "$ZIP_FILE" ]] || die "Downloaded file is empty"
 
 # -------------------------------------------------------------------
-# Verify checksum
+# Verify SHA256
 # -------------------------------------------------------------------
 
-EXPECTED_SHA256="${PROTOC_SHA256:-}"
+if [[ -n "$PROTOC_SHA256" ]]; then
+    [[ "$PROTOC_SHA256" =~ ^[a-fA-F0-9]{64}$ ]] \
+        || die "Invalid PROTOC_SHA256"
 
-if [[ -n "$RELEASE_SHA256" ]]; then
-    EXPECTED_SHA256="${RELEASE_SHA256#sha256:}"
-fi
+    if command -v sha256sum >/dev/null 2>&1; then
+        ACTUAL_SHA256="$(sha256sum "$ZIP_FILE" | awk '{print $1}')"
+    elif command -v shasum >/dev/null 2>&1; then
+        ACTUAL_SHA256="$(shasum -a 256 "$ZIP_FILE" | awk '{print $1}')"
+    else
+        die "sha256sum or shasum is required for checksum verification"
+    fi
 
-if [[ -n "${PROTOC_SHA256:-}" && -n "$RELEASE_SHA256" ]]; then
-    [[ "${PROTOC_SHA256,,}" == "${RELEASE_SHA256#sha256:}" ]] \
-        || die "PROTOC_SHA256 does not match GitHub release digest"
-fi
+    EXPECTED_SHA256="$(printf '%s' "$PROTOC_SHA256" | tr 'A-F' 'a-f')"
+    ACTUAL_SHA256="$(printf '%s' "$ACTUAL_SHA256" | tr 'A-F' 'a-f')"
 
-if [[ -n "$EXPECTED_SHA256" ]]; then
-    ACTUAL_SHA256="$(python3 - "$ZIP_FILE" <<'PY'
-import hashlib
-import sys
-
-h = hashlib.sha256()
-with open(sys.argv[1], "rb") as f:
-    for chunk in iter(lambda: f.read(1024 * 1024), b""):
-        h.update(chunk)
-
-print(h.hexdigest())
-PY
-)"
-
-    [[ "${ACTUAL_SHA256,,}" == "${EXPECTED_SHA256,,}" ]] \
+    [[ "$ACTUAL_SHA256" == "$EXPECTED_SHA256" ]] \
         || die "SHA256 checksum verification failed"
 
     log "SHA256 verification passed"
 else
     if [[ "$REQUIRE_CHECKSUM" == "1" ]]; then
-        die "No trusted SHA256 digest available for this release"
+        die "PROTOC_SHA256 is required when REQUIRE_CHECKSUM=1"
     fi
 
-    log "WARNING: No SHA256 digest available; skipping verification"
+    log "WARNING: SHA256 verification skipped"
 fi
 
 # -------------------------------------------------------------------
@@ -220,13 +188,17 @@ fi
 
 log "Extracting archive..."
 
+unzip -tq "$ZIP_FILE" \
+    || die "Invalid or corrupted archive"
+
 unzip -q "$ZIP_FILE" -d "$EXTRACT_DIR"
 
-[[ -f "${EXTRACT_DIR}/bin/protoc" ]] \
+PROTOC_BIN="${EXTRACT_DIR}/bin/protoc"
+
+[[ -f "$PROTOC_BIN" ]] \
     || die "Invalid archive: bin/protoc not found"
 
-[[ -x "${EXTRACT_DIR}/bin/protoc" ]] \
-    || chmod +x "${EXTRACT_DIR}/bin/protoc"
+chmod +x "$PROTOC_BIN"
 
 # -------------------------------------------------------------------
 # Install
@@ -236,9 +208,7 @@ log "Installing protoc..."
 
 mkdir -p "${PREFIX}/bin" "${PREFIX}/include"
 
-install -m 755 \
-    "${EXTRACT_DIR}/bin/protoc" \
-    "${PREFIX}/bin/protoc"
+install -m 755 "$PROTOC_BIN" "${PREFIX}/bin/protoc"
 
 if [[ -d "${EXTRACT_DIR}/include" ]]; then
     cp -a "${EXTRACT_DIR}/include/." "${PREFIX}/include/"
@@ -254,8 +224,11 @@ log "Installation completed successfully"
 log "Installed: ${PREFIX}/bin/protoc"
 log "Version:   ${INSTALLED_VERSION}"
 
-if [[ "${PREFIX}/bin" != *":${PATH}:"* ]] \
-    && [[ ":${PATH}:" != *":${PREFIX}/bin:"* ]]; then
-    log "Add the following to your shell configuration:"
-    echo "export PATH=\"${PREFIX}/bin:\$PATH\""
-fi
+case ":${PATH}:" in
+    *":${PREFIX}/bin:"*)
+        ;;
+    *)
+        log "Add the following to your shell configuration:"
+        echo "export PATH=\"${PREFIX}/bin:\$PATH\""
+        ;;
+esac
